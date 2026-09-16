@@ -17,12 +17,18 @@ VAL_DIR = os.path.join(DATASET_DIR, "validate")
 
 IMAGE_SIZE = 128
 BATCH_SIZE = 32
-EPOCHS = 20
-LEARNING_RATE = 0.001
+EPOCHS = 25
+LEARNING_RATE = 0.0001
 
 MODEL_SAVE_PATH = "base_cnn_best_model.pth"
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+
 print(f"Using device: {device}")
 
 # ==============================
@@ -32,8 +38,7 @@ print(f"Using device: {device}")
 train_transforms = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
     transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(10),
-    transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.9, 1.0)),
+    transforms.RandomRotation(degrees=5),
     transforms.ToTensor(),
     transforms.Normalize(
         mean=[0.485, 0.456, 0.406],
@@ -83,52 +88,62 @@ class BaseCNN(nn.Module):
         super(BaseCNN, self).__init__()
 
         self.features = nn.Sequential(
-            # Block 1
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
 
-            # Block 2
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.MaxPool2d(2, 2),
 
-            # Block 3
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-
-            # Block 4
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
             nn.ReLU(),
             nn.MaxPool2d(2, 2)
         )
 
         self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(256 * 8 * 8, 512),
+            nn.Dropout(0.6),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, 2)
+            nn.Dropout(0.4),
+            nn.Linear(64, 2)
         )
 
     def forward(self, x):
         x = self.features(x)
         x = self.classifier(x)
         return x
-
+    
 model = BaseCNN().to(device)
 
 # ==============================
 # LOSS AND OPTIMIZER
 # ==============================
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=LEARNING_RATE,
+    weight_decay=5e-4)
+
+
+#schedular
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='max',
+    factor=0.5,
+    patience=3
+)
 
 # ==============================
 # TRAINING FUNCTION
@@ -212,6 +227,8 @@ for epoch in range(EPOCHS):
 
 print("\nTraining completed.")
 print(f"Best Validation Accuracy: {best_val_acc:.4f}")
+
+scheduler.step(best_val_acc)
 
 # ==============================
 # PLOT TRAINING CURVES
