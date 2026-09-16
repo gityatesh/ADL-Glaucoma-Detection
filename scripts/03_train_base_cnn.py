@@ -1,4 +1,4 @@
-"""Train a small CNN from scratch: python scripts/03_train_base_cnn.py."""
+"""Train a custom CNN from scratch: python scripts/03_train_base_cnn.py."""
 
 import csv
 import math
@@ -29,12 +29,12 @@ PLOTS_DIR = PROJECT_ROOT / "results" / "plots"
 
 IMAGE_SIZE = 128
 BATCH_SIZE = 32
-EPOCHS = 60
+EPOCHS = 40
 LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 1e-3
-LABEL_SMOOTHING = 0.1
+WEIGHT_DECAY = 1e-4
+LABEL_SMOOTHING = 0.05
 SEED = 42
-EARLY_STOPPING_PATIENCE = 10
+EARLY_STOPPING_PATIENCE = 8
 EARLY_STOPPING_MIN_DELTA = 1e-4
 LR_PATIENCE = 3
 MIN_LR = 1e-6
@@ -120,27 +120,28 @@ def build_loaders(device):
 
 
 class BaseCNN(nn.Module):
-    """Compact convolution blocks with batch normalization and spatial dropout."""
+    """Four convolution blocks with batch normalization and classifier dropout."""
 
     def __init__(self):
         super().__init__()
         layers = []
         in_channels = 3
-        for out_channels, dropout in [(16, 0.05), (32, 0.10), (48, 0.15), (64, 0.20)]:
+        for out_channels in (32, 64, 128, 256):
             layers.extend([
                 nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(out_channels),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(2),
-                nn.Dropout2d(dropout),
             ])
             in_channels = out_channels
         self.features = nn.Sequential(*layers)
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Dropout(0.35),
-            nn.Linear(64, 2),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.40),
+            nn.Linear(128, 2),
         )
 
     def forward(self, x):
@@ -267,7 +268,10 @@ def main():
                     {name: value.detach().cpu() for name, value in model.state_dict().items()},
                     MODEL_SAVE_PATH,
                 )
-                print(f"  Saved best model (validation loss: {best_val_loss:.4f}).")
+                print(
+                    f"  Saved best model (validation loss: {best_val_loss:.4f}, "
+                    f"validation accuracy: {best_val_acc:.2%})."
+                )
 
             # Patience exceeds LR_PATIENCE so a reduced rate has time to help.
             if val_loss < stopping_best_loss - EARLY_STOPPING_MIN_DELTA:
