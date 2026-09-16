@@ -23,20 +23,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATASET_DIR = PROJECT_ROOT / "dataset"
 TRAIN_DIR = DATASET_DIR / "train"
 VAL_DIR = DATASET_DIR / "validate"
-MODEL_SAVE_PATH = PROJECT_ROOT / "base_cnn_best_model.pth"
+BEST_LOSS_PATH = PROJECT_ROOT / "base_cnn_best_loss.pth"
+BEST_ACCURACY_PATH = PROJECT_ROOT / "base_cnn_best_accuracy.pth"
 HISTORY_PATH = PROJECT_ROOT / "results" / "metrics" / "base_cnn_history.csv"
 PLOTS_DIR = PROJECT_ROOT / "results" / "plots"
 
 IMAGE_SIZE = 128
 BATCH_SIZE = 32
-EPOCHS = 40
+EPOCHS = 50
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
-LABEL_SMOOTHING = 0.05
+LABEL_SMOOTHING = 0.03
 SEED = 42
-EARLY_STOPPING_PATIENCE = 8
+EARLY_STOPPING_PATIENCE = 12
 EARLY_STOPPING_MIN_DELTA = 1e-4
-LR_PATIENCE = 3
+LR_PATIENCE = 4
 MIN_LR = 1e-6
 
 
@@ -58,10 +59,10 @@ def seed_everything(seed):
 
 
 def select_device():
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -73,13 +74,11 @@ def build_loaders(device):
     train_transforms = transforms.Compose([
         transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomAffine(
-            degrees=10,
-            translate=(0.05, 0.05),
-            scale=(0.95, 1.05),
+        transforms.RandomRotation(
+            degrees=7,
             interpolation=transforms.InterpolationMode.BILINEAR,
         ),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05),
+        transforms.ColorJitter(brightness=0.075, contrast=0.075),
         transforms.ToTensor(),
         normalize,
     ])
@@ -120,19 +119,25 @@ def build_loaders(device):
 
 
 class BaseCNN(nn.Module):
-    """Four convolution blocks with batch normalization and classifier dropout."""
+    """Four convolution blocks with GroupNorm and modest dropout."""
 
     def __init__(self):
         super().__init__()
         layers = []
         in_channels = 3
-        for out_channels in (32, 64, 128, 256):
+        for out_channels, spatial_dropout in (
+            (32, 0.0), (64, 0.0), (128, 0.10), (256, 0.15)
+        ):
             layers.extend([
                 nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(out_channels),
+                # All channel counts divide evenly into eight groups. GroupNorm
+                # uses per-image statistics in both training and evaluation.
+                nn.GroupNorm(num_groups=8, num_channels=out_channels),
                 nn.ReLU(inplace=True),
                 nn.MaxPool2d(2),
             ])
+            if spatial_dropout > 0:
+                layers.append(nn.Dropout2d(spatial_dropout))
             in_channels = out_channels
         self.features = nn.Sequential(*layers)
         self.classifier = nn.Sequential(
@@ -140,7 +145,7 @@ class BaseCNN(nn.Module):
             nn.Flatten(),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.40),
+            nn.Dropout(0.35),
             nn.Linear(128, 2),
         )
 
@@ -191,6 +196,32 @@ def save_plots(history):
         fig.savefig(PLOTS_DIR / f"base_cnn_{metric}_curve.png", dpi=150)
         plt.close(fig)
 
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.step(epochs, [row["learning_rate"] for row in history], where="post")
+    ax.set(
+        xlabel="Epoch", ylabel="Learning rate", yscale="log",
+        title="Base CNN - Learning Rate",
+    )
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(PLOTS_DIR / "base_cnn_learning_rate_curve.png", dpi=150)
+    plt.close(fig)
+
+
+def save_checkpoint(model, path, metrics, description):
+    """Save a portable state_dict and report the metrics from that exact epoch."""
+    torch.save(
+        {name: value.detach().cpu() for name, value in model.state_dict().items()},
+        path,
+    )
+    print(
+        f"  Saved {description} checkpoint: {path.name} | Epoch {metrics['epoch']} | "
+        f"Train accuracy: {metrics['train_accuracy']:.2%} | "
+        f"Validation accuracy: {metrics['val_accuracy']:.2%} | "
+        f"Validation loss: {metrics['val_loss']:.4f} | "
+        f"LR: {metrics['learning_rate']:.2e}"
+    )
+
 
 def main():
     seed_everything(SEED)
@@ -198,7 +229,8 @@ def main():
     print(f"Using device: {device} | Seed: {SEED}")
     train_loader, val_loader = build_loaders(device)
     model = BaseCNN().to(device)
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters()):,}")
+    parameter_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {parameter_count:,}")
 
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     optimizer = optim.AdamW(
@@ -214,17 +246,17 @@ def main():
         min_lr=MIN_LR,
     )
 
-    MODEL_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for path in (BEST_LOSS_PATH, BEST_ACCURACY_PATH, HISTORY_PATH):
+        path.parent.mkdir(parents=True, exist_ok=True)
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     history = []
-    best_val_loss = float("inf")
+    best_loss_metrics = None
+    best_accuracy_metrics = None
     stopping_best_loss = float("inf")
-    best_epoch = 0
-    best_val_acc = 0.0
     epochs_without_improvement = 0
     fieldnames = [
-        "epoch", "train_loss", "val_loss", "train_accuracy", "val_accuracy", "learning_rate"
+        "epoch", "learning_rate", "train_loss", "train_accuracy",
+        "val_loss", "val_accuracy", "generalization_gap",
     ]
 
     with HISTORY_PATH.open("w", newline="", encoding="utf-8") as history_file:
@@ -241,6 +273,9 @@ def main():
 
             # Step once per epoch, after validation, using this epoch's loss.
             scheduler.step(val_loss)
+            # Training accuracy includes augmentation and active dropout, so this
+            # diagnostic is not a comparison of two evaluation-mode accuracies.
+            generalization_gap = train_acc - val_acc
             row = {
                 "epoch": epoch,
                 "train_loss": train_loss,
@@ -248,6 +283,7 @@ def main():
                 "train_accuracy": train_acc,
                 "val_accuracy": val_acc,
                 "learning_rate": learning_rate,  # Rate used for this epoch.
+                "generalization_gap": generalization_gap,  # Fraction, like accuracy.
             }
             history.append(row)
             writer.writerow(row)
@@ -255,22 +291,22 @@ def main():
             print(
                 f"Epoch {epoch:02d}/{EPOCHS} | LR: {learning_rate:.2e} | "
                 f"Train loss: {train_loss:.4f}, accuracy: {train_acc:.2%} | "
-                f"Val loss: {val_loss:.4f}, accuracy: {val_acc:.2%}"
+                f"Val loss: {val_loss:.4f}, accuracy: {val_acc:.2%} | "
+                f"Generalization gap: {100 * generalization_gap:+.2f} pp"
             )
 
             # Every new loss minimum is saved, even below the early-stopping delta.
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_val_acc = val_acc
-                best_epoch = epoch
-                # Keep the existing state_dict format and save portable CPU tensors.
-                torch.save(
-                    {name: value.detach().cpu() for name, value in model.state_dict().items()},
-                    MODEL_SAVE_PATH,
+            if best_loss_metrics is None or val_loss < best_loss_metrics["val_loss"]:
+                best_loss_metrics = row.copy()
+                save_checkpoint(
+                    model, BEST_LOSS_PATH, best_loss_metrics, "best validation-loss"
                 )
-                print(
-                    f"  Saved best model (validation loss: {best_val_loss:.4f}, "
-                    f"validation accuracy: {best_val_acc:.2%})."
+
+            # Independent of loss: a higher-accuracy epoch must also be retained.
+            if best_accuracy_metrics is None or val_acc > best_accuracy_metrics["val_accuracy"]:
+                best_accuracy_metrics = row.copy()
+                save_checkpoint(
+                    model, BEST_ACCURACY_PATH, best_accuracy_metrics, "best validation-accuracy"
                 )
 
             # Patience exceeds LR_PATIENCE so a reduced rate has time to help.
@@ -289,11 +325,21 @@ def main():
                 break
 
     save_plots(history)
+    print("\nTraining completed.")
     print(
-        f"\nTraining completed. Best epoch: {best_epoch} | "
-        f"Validation loss: {best_val_loss:.4f} | Accuracy at best loss: {best_val_acc:.2%}"
+        f"Best validation-loss epoch: {best_loss_metrics['epoch']} | "
+        f"Validation loss: {best_loss_metrics['val_loss']:.4f} | "
+        f"Validation accuracy: {best_loss_metrics['val_accuracy']:.2%}"
     )
-    print(f"Best model: {MODEL_SAVE_PATH}")
+    print(
+        f"Best validation-accuracy epoch: {best_accuracy_metrics['epoch']} | "
+        f"Validation accuracy: {best_accuracy_metrics['val_accuracy']:.2%} | "
+        f"Validation loss: {best_accuracy_metrics['val_loss']:.4f}"
+    )
+    print(f"Final train accuracy: {history[-1]['train_accuracy']:.2%}")
+    print(f"Trainable parameters: {parameter_count:,}")
+    print(f"Best-loss model: {BEST_LOSS_PATH}")
+    print(f"Best-accuracy model: {BEST_ACCURACY_PATH}")
     print(f"History: {HISTORY_PATH}")
     print(f"Plots: {PLOTS_DIR}")
 
