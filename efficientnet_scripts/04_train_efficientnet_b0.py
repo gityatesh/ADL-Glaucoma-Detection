@@ -1,4 +1,4 @@
-"""Two-stage ImageNet transfer learning: python scripts/04_train_efficientnet_b0.py.
+"""Run: python efficientnet_scripts/04_train_efficientnet_b0.py.
 
 Only training and validation images are read. Test evaluation belongs in a
 separate script after the experiment and model-selection rules are finalized.
@@ -35,8 +35,9 @@ HISTORY_PATH = PROJECT_ROOT / "results" / "metrics" / "efficientnet_b0_history.c
 PLOTS_DIR = PROJECT_ROOT / "results" / "plots"
 
 MODEL_NAME = "torchvision.models.efficientnet_b0"
-# Pin the weight version so a future change to DEFAULT cannot alter this experiment.
-WEIGHTS = EfficientNet_B0_Weights.IMAGENET1K_V1
+# Torchvision manages the official download in its normal cache outside this project.
+# Checkpoints record the resolved weight version for reproducibility.
+WEIGHTS = EfficientNet_B0_Weights.DEFAULT
 IMAGE_SIZE = 224
 BATCH_SIZE = 32  # Lower this on the Mac only if unified memory is insufficient.
 NUM_WORKERS = 0  # Portable on Windows and macOS; augmentation runs in the seeded process.
@@ -45,7 +46,7 @@ CLASSIFIER_DROPOUT = 0.30
 LABEL_SMOOTHING = 0.02
 WEIGHT_DECAY = 1e-4
 STAGE1_EPOCHS = 8
-STAGE2_EPOCHS = 20
+STAGE2_EPOCHS = 15
 STAGE1_CLASSIFIER_LR = 1e-3
 STAGE2_BACKBONE_LR = 1e-5
 STAGE2_CLASSIFIER_LR = 1e-4
@@ -53,13 +54,13 @@ UNFREEZE_LAST_BLOCKS = 3  # EfficientNetB0 features[6], features[7], features[8]
 LR_PATIENCE = 3
 MIN_BACKBONE_LR = 1e-7
 MIN_CLASSIFIER_LR = 1e-6
-EARLY_STOPPING_PATIENCE = 8
+EARLY_STOPPING_PATIENCE = 6
 MIN_DELTA = 1e-4
 POSITIVE_CLASS = "glaucoma"
 
 HISTORY_FIELDS = [
     "stage",
-    "epoch",
+    "stage_epoch",
     "global_epoch",
     "learning_rate_backbone",
     "learning_rate_classifier",
@@ -118,7 +119,7 @@ def build_transforms():
             resize,
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomRotation(
-                degrees=6, interpolation=transforms.InterpolationMode.BILINEAR
+                degrees=5, interpolation=transforms.InterpolationMode.BILINEAR
             ),
             transforms.ColorJitter(brightness=0.05, contrast=0.05),
             transforms.ToTensor(),
@@ -159,6 +160,7 @@ def build_dataloaders(device):
         generator=torch.Generator().manual_seed(SEED + 1),
     )
     print("Class mapping:", train_dataset.class_to_idx)
+    print(f"Batch size: {BATCH_SIZE} | DataLoader workers: {NUM_WORKERS}")
     print("Positive disease class: glaucoma (index 0)")
     # Future evaluation must use y_true = (labels == glaucoma_idx) and
     # y_score = softmax(logits, dim=1)[:, glaucoma_idx] for glaucoma ROC-AUC/recall.
@@ -174,6 +176,7 @@ def build_model():
     model = efficientnet_b0(weights=WEIGHTS)
     in_features = model.classifier[1].in_features
     model.classifier = nn.Sequential(nn.Dropout(CLASSIFIER_DROPOUT), nn.Linear(in_features, 2))
+    print(f"Pretrained weights loaded: EfficientNet_B0_Weights.{WEIGHTS.name}")
     return model
 
 
@@ -188,9 +191,31 @@ def set_stage2_trainable(model):
     set_stage1_trainable(model)
     if not 0 < UNFREEZE_LAST_BLOCKS < len(model.features):
         raise ValueError("Fine tuning must unfreeze only part of the backbone.")
-    # Adapt high-level features while keeping earlier visual filters fixed.
+    # Early ImageNet filters capture edges, gradients, textures and simple shapes.
+    # Adapt only later semantic features to the retina, limiting overfitting and
+    # catastrophic forgetting of useful pretrained representations.
     for block in model.features[-UNFREEZE_LAST_BLOCKS:]:
         block.requires_grad_(True)
+
+
+def verify_trainable_parameters(model, stage):
+    """Check the actual parameter flags before constructing each stage's optimizer."""
+    expected = {id(parameter) for parameter in model.classifier.parameters()}
+    if stage == 2:
+        expected.update(
+            id(parameter)
+            for block in model.features[-UNFREEZE_LAST_BLOCKS:]
+            for parameter in block.parameters()
+        )
+    elif stage != 1:
+        raise ValueError(f"Unknown training stage: {stage}")
+    actual = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    if actual != expected:
+        raise RuntimeError(f"Stage {stage} trainable parameters do not match the intended layers.")
+    print(
+        f"Stage {stage} trainability verified: "
+        + ("classifier only." if stage == 1 else "final feature groups and classifier only.")
+    )
 
 
 def set_training_mode(model):
@@ -205,6 +230,49 @@ def set_training_mode(model):
     for module in model.features.modules():
         if isinstance(module, nn.BatchNorm2d):
             module.eval()
+
+
+@torch.no_grad()
+def sanity_check(model, train_loader, device):
+    """Check one real batch without changing the subsequent shuffled/augmented batches."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    loader_state = train_loader.generator.get_state()
+    was_training = model.training
+    try:
+        model.eval()  # No dropout, stochastic depth or BatchNorm buffer updates.
+        images, labels = next(iter(train_loader))
+        if images.ndim != 4 or tuple(images.shape[1:]) != (3, IMAGE_SIZE, IMAGE_SIZE):
+            raise RuntimeError(f"Unexpected input shape: {tuple(images.shape)}")
+        if labels.shape != (images.size(0),) or labels.dtype != torch.long:
+            raise RuntimeError("Expected one integer class label per image.")
+        if not ((labels == 0) | (labels == 1)).all().item():
+            raise RuntimeError("Expected glaucoma=0 and normal=1 labels.")
+        images = images.to(device)
+        labels = labels.to(device)
+        logits = model(images)
+        if tuple(logits.shape) != (images.size(0), 2):
+            raise RuntimeError(f"Expected [batch_size, 2] outputs, got {tuple(logits.shape)}")
+        if not (logits.device == images.device == labels.device == next(model.parameters()).device):
+            raise RuntimeError("Model, inputs, labels and outputs must use the same device.")
+        if not torch.isfinite(logits).all().item():
+            raise RuntimeError(
+                "Pretrained model produced non-finite outputs during the sanity check."
+            )
+        print(
+            f"Sanity check passed | Input: {list(images.shape)} | "
+            f"Output: {list(logits.shape)} | Device: {logits.device}"
+        )
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        train_loader.generator.set_state(loader_state)
+        if was_training:
+            set_training_mode(model)
+        else:
+            model.eval()
 
 
 def build_optimizer(model, stage):
@@ -291,6 +359,7 @@ def experiment_metadata(train_loader, val_loader):
         "resize_policy": "resize directly to square; no crop",
         "classifier_dropout": CLASSIFIER_DROPOUT,
         "seed": SEED,
+        "generalization_gap_units": "fraction",
         "training_images": len(train_loader.dataset),
         "validation_images": len(val_loader.dataset),
         "training_config": {
@@ -312,7 +381,7 @@ def experiment_metadata(train_loader, val_loader):
             "early_stopping_patience": EARLY_STOPPING_PATIENCE,
             "min_delta": MIN_DELTA,
             "horizontal_flip_probability": 0.5,
-            "rotation_degrees": 6,
+            "rotation_degrees": 5,
             "brightness_jitter": 0.05,
             "contrast_jitter": 0.05,
         },
@@ -328,6 +397,9 @@ def save_checkpoint(model, path, metrics, metadata, selection_metric):
     # CPU tensors make the checkpoint portable between MPS, CUDA and CPU.
     checkpoint = dict(metadata)
     checkpoint.update(metrics)
+    checkpoint["epoch"] = metrics["stage_epoch"]
+    checkpoint["validation_loss"] = metrics["val_loss"]
+    checkpoint["validation_accuracy"] = metrics["val_accuracy"]
     checkpoint["selection_metric"] = selection_metric
     checkpoint["model_state_dict"] = {
         name: value.detach().cpu() for name, value in model.state_dict().items()
@@ -335,7 +407,7 @@ def save_checkpoint(model, path, metrics, metadata, selection_metric):
     torch.save(checkpoint, path)
     print(
         f"  Saved best {selection_metric} checkpoint: {path.name}\n"
-        f"  Stage {metrics['stage']} | Epoch {metrics['epoch']} "
+        f"  Stage {metrics['stage']} | Epoch {metrics['stage_epoch']} "
         f"(global {metrics['global_epoch']}) | "
         f"Train accuracy: {metrics['train_accuracy']:.2%} | "
         f"Validation accuracy: {metrics['val_accuracy']:.2%} | "
@@ -385,13 +457,13 @@ def plot_history(history):
 def print_best_epochs(label, records):
     loss_record, accuracy_record = records["loss"], records["accuracy"]
     print(
-        f"{label} best-loss epoch: {loss_record['epoch']} "
+        f"{label} best-loss epoch: {loss_record['stage_epoch']} "
         f"(stage {loss_record['stage']}, global {loss_record['global_epoch']}) | "
         f"Validation loss: {loss_record['val_loss']:.4f} | "
         f"Validation accuracy: {loss_record['val_accuracy']:.2%}"
     )
     print(
-        f"{label} best-accuracy epoch: {accuracy_record['epoch']} "
+        f"{label} best-accuracy epoch: {accuracy_record['stage_epoch']} "
         f"(stage {accuracy_record['stage']}, global {accuracy_record['global_epoch']}) | "
         f"Validation accuracy: {accuracy_record['val_accuracy']:.2%} | "
         f"Validation loss: {accuracy_record['val_loss']:.4f}"
@@ -407,7 +479,7 @@ def main():
     metadata = experiment_metadata(train_loader, val_loader)
     metadata["device"] = str(device)
     model = build_model().to(device)
-    print(f"Model: {MODEL_NAME} | Weights: {WEIGHTS.name}")
+    print(f"Model: EfficientNetB0 ({MODEL_NAME}) | Weights: {WEIGHTS.name}")
     total_parameters = sum(p.numel() for p in model.parameters())
     criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
     history = []
@@ -432,12 +504,15 @@ def main():
                     f"Fine tuning feature groups: {list(range(len(model.features) - UNFREEZE_LAST_BLOCKS, len(model.features)))}"
                 )
 
+            verify_trainable_parameters(model, stage)
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             trainable_counts[stage] = trainable
             print(
                 f"\nStage {stage} | Total parameters: {total_parameters:,} | "
                 f"Trainable: {trainable:,} | Frozen: {total_parameters - trainable:,}"
             )
+            if stage == 1:
+                sanity_check(model, train_loader, device)
             optimizer = build_optimizer(model, stage)
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer,
@@ -460,7 +535,7 @@ def main():
                 val_loss, val_acc = validate(model, val_loader, criterion, device)
                 row = {
                     "stage": stage,
-                    "epoch": epoch,
+                    "stage_epoch": epoch,
                     "global_epoch": len(history) + 1,
                     "learning_rate_backbone": learning_rates.get("backbone", 0.0),
                     "learning_rate_classifier": learning_rates["classifier"],
@@ -469,6 +544,7 @@ def main():
                     "val_loss": val_loss,
                     "val_accuracy": val_acc,
                     # Online training accuracy includes augmentation and dropout.
+                    # The gap is a fraction in both the CSV and console output.
                     "generalization_gap": train_acc - val_acc,
                 }
                 history.append(row)
@@ -480,7 +556,7 @@ def main():
                     f"LR classifier: {row['learning_rate_classifier']:.2e}\n"
                     f"  Train loss: {train_loss:.4f} | Train accuracy: {train_acc:.2%} | "
                     f"Val loss: {val_loss:.4f} | Val accuracy: {val_acc:.2%} | "
-                    f"Generalization gap: {100 * (train_acc - val_acc):+.2f} pp"
+                    f"Generalization gap (fraction): {row['generalization_gap']:+.4f}"
                 )
                 if stage_best["loss"] is None or val_loss < stage_best["loss"]["val_loss"]:
                     stage_best["loss"] = row.copy()
